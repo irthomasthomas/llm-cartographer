@@ -1,0 +1,31 @@
+[project]
+name = "llm-cartographer"
+version = "0.1.0"
+description = "LLM plugin for automatically mapping and describing a codebase or project"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "Thomas Thomas", email = "author@example.com"}
+]
+dependencies = [
+    "llm>=0.5.0",
+    "click>=8.0.0",
+    "pathspec>=0.11.0",
+    "rich>=13.0.0",
+    "tqdm>=4.64.0",
+    "colorama>=0.4.6"
+]
+
+[project.entry-points.llm]
+cartographer = "llm_cartographer"
+
+[project.optional-dependencies]
+test = [
+    "pytest",
+    "pytest-mock"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
