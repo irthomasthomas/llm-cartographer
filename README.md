@@ -44,6 +44,7 @@ Options:
   --visual                       Generate visual diagram of codebase architecture
   --diagram-format [graphviz|mermaid|plantuml]
                                  Format for diagram generation (default: graphviz)
+  --llm-nav                      Enable LLM-based codebase navigation
   --help                         Show this message and exit.
 ```
 
@@ -139,6 +140,7 @@ llm cartographer . --visual --output ./results
 - 🎨 **Rich Formatting**: Enhanced output using rich library with improved readability
 - 📁 **Output Directory**: Support for saving multiple output files to a specified directory
 - 📊 **Markdown Diagrams**: Support for Mermaid and PlantUML diagrams that display directly in Markdown
+- 🧭 **Codebase Navigation**: Navigate through the codebase using LLM for better understanding and insights
 
 ## Analysis Modes
 

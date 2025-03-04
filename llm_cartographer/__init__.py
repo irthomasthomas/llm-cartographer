@@ -1716,6 +1716,8 @@ This diagram uses [PlantUML](https://plantuml.com/), which can be viewed:
             raise
 
 # Register the LLM plugin command
+from llm_cartographer.codebase_navigator import CodebaseNavigator
+
 @llm.hookimpl
 def register_commands(cli):
     @cli.command(name="cartographer")
@@ -1737,8 +1739,14 @@ def register_commands(cli):
     @click.option("--visual", is_flag=True, help="Generate visual diagram of codebase architecture")
     @click.option("--diagram-format", type=click.Choice(DIAGRAM_FORMATS), default="graphviz",
                   help="Format for diagram generation (graphviz, mermaid, plantuml)")
+    @click.option("--llm-nav", is_flag=True, help="Generate LLM-optimized navigation structure")
+    @click.option("--nav-format", type=click.Choice(['markdown', 'json', 'compact']), default='markdown',
+                  help="Format for LLM navigation output")
+    @click.option("--include-source", is_flag=True, 
+                  help="Include source code snippets for functions and methods in navigation output")
     def cartographer(directory, exclude, max_files, max_file_size, output, model, follow_symlinks, 
-                    json, filter_extension, cache_dir, mode, focus, reasoning, visual, diagram_format):
+                    json, filter_extension, cache_dir, mode, focus, reasoning, visual, diagram_format,
+                    llm_nav, nav_format, include_source):
         """Map and analyze a codebase or project structure."""
         try:
             filter_extensions = set(f".{ext.lstrip('.')}" for ext in filter_extension) if filter_extension else None
@@ -1761,9 +1769,42 @@ def register_commands(cli):
                 diagram_format=diagram_format
             )
             
-            result = analyzer.run()
-            if json:
-                click.echo(result)
+            # If LLM navigation is requested, generate that instead of regular analysis
+            if llm_nav:
+                # First scan the directory to collect data
+                collected_data = analyzer.scan_directory()
+                
+                # Create the navigator
+                focus_dir = analyzer.focus_dir if analyzer.focus else None
+                navigator = CodebaseNavigator(
+                    directory=analyzer.directory,
+                    collected_data=collected_data,
+                    focus=focus_dir,
+                    include_source=include_source
+                )
+                
+                # Generate the navigation output
+                nav_output = navigator.generate_llm_output(format=nav_format)
+                
+                # Save or display the output
+                if output:
+                    if analyzer.output_is_dir:
+                        output_file = Path(output) / f"navigation.{nav_format}"
+                    else:
+                        output_file = Path(output)
+                    
+                    with open(output_file, 'w') as f:
+                        f.write(nav_output)
+                    console.print(f"[green]Navigation output saved to: {output_file}")
+                
+                # Print the output if JSON format or explicitly requested
+                if json or not output:
+                    click.echo(nav_output)
+            else:
+                # Regular analysis flow
+                result = analyzer.run()
+                if json:
+                    click.echo(result)
             
         except Exception as e:
             console.print(f"[bold red]Error: {e}")
