@@ -1,6 +1,6 @@
 [project]
 name = "llm-cartographer"
-version = "0.1.0"
+version = "0.1.1"
 description = "LLM plugin for automatically mapping and describing a codebase or project"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -29,3 +29,9 @@ test = [
 [build-system]
 requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["llm_cartographer"]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["cache/*"]

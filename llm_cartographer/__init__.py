@@ -4,11 +4,12 @@ import json
 import hashlib
 import time
 import shutil
+import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, Set, Literal
+from typing import Dict, List, Optional, Tuple, Any, Set, Literal, Generator, Union
 import textwrap
 import tempfile
-
+import concurrent.futures
 import click
 import llm
 from rich.console import Console
@@ -22,7 +23,17 @@ from pathspec.patterns import GitWildMatchPattern
 from tqdm import tqdm
 from colorama import Fore, Style, init
 
+# Import utility functions
+from .utils import (
+    safe_read_file, count_lines_in_file, is_text_file, 
+    get_file_info, parallel_process, Timer, check_process_memory_usage
+)
+
 init(autoreset=True)  # Initialize colorama
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("llm_cartographer")
 
 # Initialize rich console for fancy output
 console = Console()
@@ -93,7 +104,10 @@ class CodebaseCartographer:
                  focus: Optional[str] = None,
                  reasoning: int = 5,
                  visual: bool = False,
-                 diagram_format: str = "graphviz"):
+                 diagram_format: str = "graphviz",
+                 parallel: bool = True,
+                 max_workers: int = None,
+                 verbose: bool = False):
         """
         Initialize the CodebaseCartographer.
         
@@ -114,7 +128,14 @@ class CodebaseCartographer:
             reasoning: Depth of reasoning (0-9)
             visual: Generate visual diagram of codebase architecture
             diagram_format: Format for diagram generation (graphviz, mermaid, plantuml)
+            parallel: Whether to use parallel processing
+            max_workers: Maximum number of worker threads for parallel processing
+            verbose: Whether to output verbose logging
         """
+        # Configure logging based on verbosity
+        if verbose:
+            logger.setLevel(logging.DEBUG)
+        
         self.directory = Path(directory).resolve()
         if not self.directory.exists():
             raise ValueError(f"Directory '{directory}' does not exist")
@@ -125,6 +146,9 @@ class CodebaseCartographer:
         self.max_files = max_files
         self.max_file_size = max_file_size
         self.max_map_tokens = max_map_tokens
+        self.verbose = verbose
+        self.parallel = parallel
+        self.max_workers = max_workers or min(32, (os.cpu_count() or 4) + 4)
         
         # Process output path - could be a file or directory
         self.output_path = Path(output) if output else None
@@ -182,7 +206,7 @@ class CodebaseCartographer:
             console.print(f"[red]Error loading model {self.model_name}: {e}")
             console.print(f"[yellow]Available models: {', '.join(llm.get_model_names())}")
             raise
-
+            
         # Statistics for reporting
         self.stats = {
             "total_files": 0,
@@ -205,7 +229,7 @@ class CodebaseCartographer:
         
         # Store diagram code if visual is enabled
         self.diagram_code = None
-
+    
     def is_excluded(self, path: Path) -> bool:
         """Check if a path should be excluded based on patterns."""
         rel_path = str(path.relative_to(self.directory))
@@ -223,7 +247,7 @@ class CodebaseCartographer:
             return True
             
         return False
-
+    
     def is_important_file(self, path: Path) -> bool:
         """Check if a file is an 'important' file based on patterns."""
         filename = path.name
@@ -245,24 +269,7 @@ class CodebaseCartographer:
                     return True
                 
         return False
-
-    def is_text_file(self, path: Path) -> bool:
-        """Determine if a file is a text file."""
-        # Check extension
-        if path.suffix.lower() in TEXT_EXTENSIONS:
-            return True
-            
-        # Try to read the first 4KB as text
-        try:
-            with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-                sample = f.read(4096)
-                # Check for null bytes which indicate binary
-                if ' ' in sample:
-                    return False
-                return True
-        except Exception:
-            return False
-
+    
     def get_language_from_extension(self, extension: str) -> str:
         """Map file extensions to programming languages."""
         extension = extension.lower()
@@ -327,7 +334,25 @@ class CodebaseCartographer:
         }
         
         return extension_map.get(extension, f"Unknown ({extension})")
-
+    
+    def analyze_file_wrapper(self, file_path: Path) -> Tuple[bool, Path, Optional[str]]:
+        """
+        Wrapper around analyze_file to handle exceptions for parallel processing.
+        
+        Args:
+            file_path: Path to the file to analyze
+            
+        Returns:
+            Tuple containing (success, file_path, error_message)
+        """
+        try:
+            self.analyze_file(file_path)
+            return (True, file_path, None)
+        except Exception as e:
+            if self.verbose:
+                logger.error(f"Error analyzing {file_path}: {str(e)}")
+            return (False, file_path, str(e))
+    
     def scan_directory(self) -> Dict[str, Any]:
         """
         Scan the directory and collect information about the codebase.
@@ -342,18 +367,19 @@ class CodebaseCartographer:
                            title="[bold blue]Analysis Started",
                            border_style="blue"))
         
-        # Find all files
-        all_files = []
-        for root, dirs, files in os.walk(scan_root, followlinks=self.follow_symlinks):
-            root_path = Path(root)
-            
-            # Apply directory exclusions in-place
-            dirs[:] = [d for d in dirs if not self.is_excluded(root_path / d)]
-            
-            for file in files:
-                file_path = root_path / file
-                if not self.is_excluded(file_path):
-                    all_files.append(file_path)
+        # Find all files with Timer for performance measurement
+        with Timer("File discovery") as t:
+            all_files = []
+            for root, dirs, files in os.walk(scan_root, followlinks=self.follow_symlinks):
+                root_path = Path(root)
+                
+                # Apply directory exclusions in-place
+                dirs[:] = [d for d in dirs if not self.is_excluded(root_path / d)]
+                
+                for file in files:
+                    file_path = root_path / file
+                    if not self.is_excluded(file_path):
+                        all_files.append(file_path)
         
         self.stats["total_files"] = len(all_files)
         
@@ -420,15 +446,37 @@ class CodebaseCartographer:
         ) as progress:
             task = progress.add_task("[yellow]Analyzing files...", total=len(files_to_analyze))
             
-            for file_path in files_to_analyze:
-                try:
-                    self.analyze_file(file_path)
-                    self.stats["analyzed_files"] += 1
-                except Exception as e:
-                    self.stats["skipped_files"] += 1
-                    console.print(f"[red]Error analyzing {file_path}: {e}")
+            if self.parallel and len(files_to_analyze) > 10:
+                # Use parallel processing for a large number of files
+                with Timer(f"Parallel file analysis ({self.max_workers} workers)"):
+                    results = parallel_process(
+                        items=files_to_analyze,
+                        process_func=self.analyze_file_wrapper,
+                        max_workers=self.max_workers
+                    )
                 
-                progress.update(task, advance=1, description=f"[yellow]Analyzing {self.stats['analyzed_files']}/{len(files_to_analyze)} files")
+                # Process results
+                for success, file_path, error in results:
+                    if success:
+                        self.stats["analyzed_files"] += 1
+                    else:
+                        self.stats["skipped_files"] += 1
+                        if self.verbose:
+                            console.print(f"[red]Error analyzing {file_path}: {error}")
+                    
+                    progress.update(task, advance=1, description=f"[yellow]Analyzing {self.stats['analyzed_files']}/{len(files_to_analyze)} files")
+            else:
+                # Sequential processing for smaller codebases or when parallel is disabled
+                for file_path in files_to_analyze:
+                    try:
+                        self.analyze_file(file_path)
+                        self.stats["analyzed_files"] += 1
+                    except Exception as e:
+                        self.stats["skipped_files"] += 1
+                        if self.verbose:
+                            console.print(f"[red]Error analyzing {file_path}: {e}")
+                    
+                    progress.update(task, advance=1, description=f"[yellow]Analyzing {self.stats['analyzed_files']}/{len(files_to_analyze)} files")
         
         # Generate language statistics
         self.collected_data["language_stats"] = {
@@ -456,7 +504,7 @@ class CodebaseCartographer:
         }
         
         return self.collected_data
-
+    
     def analyze_file(self, file_path: Path) -> None:
         """
         Analyze a single file and add its information to the collected data.
@@ -482,20 +530,39 @@ class CodebaseCartographer:
         
         # Get file content (for text files only)
         content = ""
-        if self.is_text_file(file_path):
+        line_count = 0
+        
+        if is_text_file(file_path):
             try:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    lines = f.readlines()
-                    self.stats["total_lines"] += len(lines)
+                # Count lines without loading the entire file
+                line_count = count_lines_in_file(file_path)
+                self.stats["total_lines"] += line_count
+                
+                # For content, read efficiently with size limits
+                if line_count > 20:
+                    # Get a representative sample - first and last 10 lines
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        first_lines = ''.join(f.readline() for _ in range(10))
                     
-                    # Get a representative sample of the file
-                    if len(lines) > 20:
-                        # Get first 10 and last 10 lines
-                        content = ''.join(lines[:10] + ['...\n'] + lines[-10:])
-                    else:
-                        content = ''.join(lines)
+                    # Use seek to efficiently get last lines without reading whole file
+                    content = first_lines + '...\n'
+                    
+                    # Read last 10 lines efficiently
+                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        # Use a deque with maxlen to keep only the last 10 lines
+                        from collections import deque
+                        last_lines = deque(maxlen=10)
+                        for line in f:
+                            last_lines.append(line)
+                    
+                    content += ''.join(last_lines)
+                else:
+                    # Small file, read it all
+                    content = safe_read_file(file_path, max_size=self.max_file_size)
             except Exception as e:
                 content = f"Error reading file: {e}"
+                if self.verbose:
+                    logger.warning(f"Error reading {file_path}: {e}")
         else:
             content = "[Binary file]"
             
@@ -504,7 +571,7 @@ class CodebaseCartographer:
             "path": rel_path,
             "language": language,
             "size_bytes": file_path.stat().st_size,
-            "lines": content.count('\n') + 1,
+            "lines": line_count,
             "sample": content[:2000] if len(content) > 2000 else content  # Limit sample size
         }
         
@@ -512,7 +579,7 @@ class CodebaseCartographer:
             self.collected_data["important_files"][rel_path] = file_info
         else:
             self.collected_data["file_samples"][rel_path] = file_info
-
+    
     def analyze_directory_structure(self) -> Dict[str, Any]:
         """
         Analyze the directory structure of the codebase.
@@ -565,7 +632,7 @@ class CodebaseCartographer:
                 }
                 
         return directories
-
+    
     def get_project_info(self) -> Dict[str, Any]:
         """
         Get general project information.
@@ -588,18 +655,18 @@ class CodebaseCartographer:
         readme_files = list(project_root.glob("README*"))
         if readme_files:
             try:
-                with open(readme_files[0], 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-                    # Truncate if too long
-                    max_readme = 3000  # About 750 tokens
-                    project_info["readme"] = (
-                        content[:max_readme] + "..." if len(content) > max_readme else content
-                    )
+                content = safe_read_file(readme_files[0], max_size=3000)  # About 750 tokens
+                if content:
+                    project_info["readme"] = content
+                    if len(content) == 3000:
+                        project_info["readme"] += "... (truncated)"
             except Exception as e:
                 project_info["readme_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error reading README: {e}")
                 
         return project_info
-
+    
     def get_git_info(self) -> Dict[str, Any]:
         """
         Get Git repository information.
@@ -640,9 +707,11 @@ class CodebaseCartographer:
                 
         except Exception as e:
             git_info["error"] = str(e)
+            if self.verbose:
+                logger.warning(f"Error getting git info: {e}")
             
         return git_info
-
+    
     def analyze_dependencies(self) -> Dict[str, Any]:
         """
         Analyze project dependencies.
@@ -657,8 +726,9 @@ class CodebaseCartographer:
         package_json = project_root / "package.json"
         if package_json.exists() and package_json.is_file():
             try:
-                with open(package_json, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
+                content = safe_read_file(package_json)
+                if content:
+                    data = json.loads(content)
                     deps = {}
                     if "dependencies" in data:
                         deps["dependencies"] = data["dependencies"]
@@ -667,59 +737,73 @@ class CodebaseCartographer:
                     dependencies["javascript"] = deps
             except Exception as e:
                 dependencies["javascript_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error parsing package.json: {e}")
                 
         # Check for requirements.txt (Python)
         requirements_txt = project_root / "requirements.txt"
         if requirements_txt.exists() and requirements_txt.is_file():
             try:
-                with open(requirements_txt, 'r', encoding='utf-8') as f:
-                    requirements = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                content = safe_read_file(requirements_txt)
+                if content:
+                    requirements = [line.strip() for line in content.splitlines() 
+                                    if line.strip() and not line.startswith('#')]
                     dependencies["python"] = requirements
             except Exception as e:
                 dependencies["python_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error parsing requirements.txt: {e}")
                 
         # Check for pyproject.toml (Python)
         pyproject_toml = project_root / "pyproject.toml"
         if pyproject_toml.exists() and pyproject_toml.is_file():
             try:
-                with open(pyproject_toml, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                content = safe_read_file(pyproject_toml)
+                if content:
                     dependencies["python_pyproject"] = content
             except Exception as e:
                 dependencies["python_pyproject_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error parsing pyproject.toml: {e}")
                 
         # Check for Cargo.toml (Rust)
         cargo_toml = project_root / "Cargo.toml"
         if cargo_toml.exists() and cargo_toml.is_file():
             try:
-                with open(cargo_toml, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                content = safe_read_file(cargo_toml)
+                if content:
                     dependencies["rust"] = content
             except Exception as e:
                 dependencies["rust_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error parsing Cargo.toml: {e}")
         
         # Check for pom.xml (Java/Maven)
         pom_xml = project_root / "pom.xml"
         if pom_xml.exists() and pom_xml.is_file():
             try:
-                with open(pom_xml, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                content = safe_read_file(pom_xml)
+                if content:
                     dependencies["java"] = content
             except Exception as e:
                 dependencies["java_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error parsing pom.xml: {e}")
                 
         # Check for build.gradle (Java/Gradle)
         build_gradle = project_root / "build.gradle"
         if build_gradle.exists() and build_gradle.is_file():
             try:
-                with open(build_gradle, 'r', encoding='utf-8') as f:
-                    content = f.read()
+                content = safe_read_file(build_gradle)
+                if content:
                     dependencies["java_gradle"] = content
             except Exception as e:
                 dependencies["java_gradle_error"] = str(e)
+                if self.verbose:
+                    logger.warning(f"Error parsing build.gradle: {e}")
                 
         return dependencies
-
+    
     def run_git_command(self, command: List[str]) -> str:
         """
         Run a git command and return its output.
@@ -755,8 +839,42 @@ class CodebaseCartographer:
                            title="[bold blue]Processing",
                            border_style="blue"))
         
+        # Check memory usage before processing
+        if self.verbose:
+            memory_usage = check_process_memory_usage()
+            logger.debug(f"Memory usage before map generation: {memory_usage}")
+        
         # Calculate cache key based on collected data and model
-        data_hash = hashlib.md5(json.dumps(self.collected_data, sort_keys=True).encode()).hexdigest()
+        try:
+            # More memory-efficient hashing approach
+            hasher = hashlib.md5()
+            
+            # Instead of serializing the entire data structure at once, process key parts separately
+            hasher.update(str(self.collected_data.get("project_info", {}).get("name", "Unknown")).encode())
+            
+            # Add statistics to hash
+            stats_str = json.dumps(self.collected_data.get("statistics", {}), sort_keys=True)
+            hasher.update(stats_str.encode())
+            
+            # Add language stats to hash
+            langs_str = json.dumps(self.collected_data.get("language_stats", {}), sort_keys=True)
+            hasher.update(langs_str.encode())
+            
+            # Hash important files by path only to save memory
+            important_files = sorted(self.collected_data.get("important_files", {}).keys())
+            hasher.update(json.dumps(important_files).encode())
+            
+            # Hash configuration parameters that affect the map generation
+            config_str = f"{self.max_map_tokens}_{self.model_name}_{self.mode}_{self.reasoning}_{self.visual}_{self.diagram_format}"
+            hasher.update(config_str.encode())
+            
+            data_hash = hasher.hexdigest()
+            
+        except Exception as e:
+            # Fall back to the original approach if there's an error
+            logger.warning(f"Error in memory-efficient hashing, falling back to standard method: {e}")
+            data_hash = hashlib.md5(json.dumps(self.collected_data, sort_keys=True).encode()).hexdigest()
+            
         cache_key = f"map_{data_hash}_{self.max_map_tokens}_{self.model_name}_{self.mode}_{self.reasoning}_{self.visual}_{self.diagram_format}"
         cache_file = self.cache_dir / f"{cache_key}.json"
         
@@ -1199,8 +1317,6 @@ B --> D
 C --> D
 @enduml
 </diagram>
-
-Choose the appropriate PlantUML diagram type (component, class, sequence, etc.) that best represents the architecture.
 """
         
         # Prepare the prompt based on diagram format

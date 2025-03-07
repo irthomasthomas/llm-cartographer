@@ -709,7 +709,8 @@ class CodebaseNavigator:
                     # Add indented source code block
                     source_code = func_info['source']
                     language = func_info['file'].split('.')[-1] if '.' in func_info['file'] else ''
-                    functions_md.append(f"  ```{language}\n  {source_code.replace('\n', '\n  ')}\n  ```")
+                    indented_source = source_code.replace('\n', '\n  ')
+                    functions_md.append(f"  ```{language}\n  {indented_source}\n  ```")
             
             sections.append("\n".join(functions_md))
             
@@ -739,8 +740,9 @@ class CodebaseNavigator:
                             method_name = method['name']
                             source_code = method['source']
                             language = class_info['file'].split('.')[-1] if '.' in class_info['file'] else ''
+                            indented_source = source_code.replace('\n', '\n    ')
                             classes_md.append(f"  - `{method_name}`:")
-                            classes_md.append(f"    ```{language}\n    {source_code.replace('\n', '\n    ')}\n    ```")
+                            classes_md.append(f"    ```{language}\n    {indented_source}\n    ```")
             
             sections.append("\n".join(classes_md))
         
