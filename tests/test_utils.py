@@ -189,19 +189,20 @@ class TestMemoryEfficientFileSample:
         """Test sampling a large file with first and last lines."""
         test_file = tmp_path / "large.txt"
         
-        # Create a file with many lines
+        # Create a file with many lines to ensure it exceeds the max_size parameter
         with open(test_file, "w") as f:
-            for i in range(100):
+            for i in range(10000):  # Increased to 10k lines
                 f.write(f"Line {i}\n")
         
-        result = memory_efficient_file_sample(test_file, sample_lines=5)
+        # Using explicit max_size parameter to force truncation
+        result = memory_efficient_file_sample(test_file, sample_lines=5, max_size=500)
         
         # Should contain first 5 lines
         for i in range(5):
             assert f"Line {i}" in result
             
         # Should contain last 5 lines
-        for i in range(95, 100):
+        for i in range(9995, 10000):
             assert f"Line {i}" in result
             
         # Should have truncation indicator

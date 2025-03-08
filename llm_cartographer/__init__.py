@@ -831,53 +831,53 @@ class CodebaseCartographer:
     def generate_map(self) -> str:
         """
         Generate a token-efficient map of the codebase for LLM consumption.
-        
+    
         Returns:
             String representation of the codebase map
         """
         console.print(Panel("🧠 Generating codebase map...",
                            title="[bold blue]Processing",
                            border_style="blue"))
-        
+    
         # Check memory usage before processing
         if self.verbose:
             memory_usage = check_process_memory_usage()
             logger.debug(f"Memory usage before map generation: {memory_usage}")
-        
+    
         # Calculate cache key based on collected data and model
         try:
             # More memory-efficient hashing approach
             hasher = hashlib.md5()
-            
+        
             # Instead of serializing the entire data structure at once, process key parts separately
             hasher.update(str(self.collected_data.get("project_info", {}).get("name", "Unknown")).encode())
-            
+        
             # Add statistics to hash
             stats_str = json.dumps(self.collected_data.get("statistics", {}), sort_keys=True)
             hasher.update(stats_str.encode())
-            
+        
             # Add language stats to hash
             langs_str = json.dumps(self.collected_data.get("language_stats", {}), sort_keys=True)
             hasher.update(langs_str.encode())
-            
+        
             # Hash important files by path only to save memory
             important_files = sorted(self.collected_data.get("important_files", {}).keys())
             hasher.update(json.dumps(important_files).encode())
-            
+        
             # Hash configuration parameters that affect the map generation
             config_str = f"{self.max_map_tokens}_{self.model_name}_{self.mode}_{self.reasoning}_{self.visual}_{self.diagram_format}"
             hasher.update(config_str.encode())
-            
+        
             data_hash = hasher.hexdigest()
-            
+        
         except Exception as e:
             # Fall back to the original approach if there's an error
             logger.warning(f"Error in memory-efficient hashing, falling back to standard method: {e}")
             data_hash = hashlib.md5(json.dumps(self.collected_data, sort_keys=True).encode()).hexdigest()
-            
+        
         cache_key = f"map_{data_hash}_{self.max_map_tokens}_{self.model_name}_{self.mode}_{self.reasoning}_{self.visual}_{self.diagram_format}"
         cache_file = self.cache_dir / f"{cache_key}.json"
-        
+    
         # Check cache
         if cache_file.exists():
             try:
@@ -886,22 +886,28 @@ class CodebaseCartographer:
                     console.print(Panel("✅ Using cached codebase map", 
                                       title="[bold green]Cache Hit",
                                       border_style="green"))
+                
+                    # Check memory usage after retrieving from cache when verbose is enabled
+                    if self.verbose:
+                        memory_usage = check_process_memory_usage()
+                        logger.debug(f"Memory usage after retrieving from cache: {memory_usage}")
+                
                     return cache_data["map"]
             except Exception as e:
                 console.print(Panel(f"⚠️ Cache read error: {e}", 
                                    title="[bold yellow]Cache Warning",
                                    border_style="yellow"))
-        
+    
         # Convert collected data to a compact representation for LLM consumption
         map_data = {}
-        
+    
         # Project name and basic info
         map_data["project"] = self.collected_data["project_info"].get("name", "Unknown")
-        
+    
         # Focus information if applicable
         if "focus" in self.collected_data["project_info"]:
             map_data["focus"] = self.collected_data["project_info"]["focus"]
-        
+    
         # Git information (if available)
         git_info = self.collected_data["project_info"].get("git_info", {})
         if git_info.get("has_git", False):
@@ -910,11 +916,11 @@ class CodebaseCartographer:
                 "branch": git_info.get("current_branch", ""),
                 "latest_commit": git_info.get("latest_commit", "")
             }
-        
+    
         # README summary
         if "readme" in self.collected_data["project_info"]:
             map_data["readme_summary"] = self.collected_data["project_info"]["readme"]
-        
+    
         # Directory structure (simplified)
         directories = {}
         for path, info in self.collected_data["directories"].items():
@@ -929,13 +935,13 @@ class CodebaseCartographer:
                 )[:3]  # Top 3 file types
             }
         map_data["directories"] = directories
-        
+    
         # Language statistics
         map_data["languages"] = {
             lang: {"files": info["files"], "percent": round(info["percentage"], 1)} 
             for lang, info in self.collected_data["language_stats"].items()
         }
-        
+    
         # Important files (with samples)
         important_files = {}
         for path, info in self.collected_data["important_files"].items():
@@ -944,13 +950,13 @@ class CodebaseCartographer:
                 "sample": info["sample"]
             }
         map_data["important_files"] = important_files
-        
+    
         # Representative file samples
         file_samples = {}
         # Limit the number of samples to keep the map concise
         sample_count = min(15, len(self.collected_data["file_samples"]))
         sample_keys = sorted(self.collected_data["file_samples"].keys())[:sample_count]
-        
+    
         for path in sample_keys:
             info = self.collected_data["file_samples"][path]
             file_samples[path] = {
@@ -958,27 +964,27 @@ class CodebaseCartographer:
                 "sample": info["sample"]
             }
         map_data["file_samples"] = file_samples
-        
+    
         # Dependencies
         map_data["dependencies"] = self.collected_data["dependencies"]
-        
+    
         # Statistics
         map_data["stats"] = self.collected_data["statistics"]
-        
+    
         # Analysis mode and reasoning depth
         map_data["analysis_mode"] = self.mode
         map_data["reasoning_depth"] = self.reasoning
-        
+    
         # Visual diagram request
         if self.visual:
             map_data["visual_diagram"] = {
                 "requested": True,
                 "format": self.diagram_format
             }
-        
+    
         # Convert to a structured string representation
         map_str = self.map_to_string(map_data)
-        
+    
         # Cache the result
         try:
             with open(cache_file, 'w') as f:
@@ -987,7 +993,12 @@ class CodebaseCartographer:
             console.print(Panel(f"⚠️ Cache write error: {e}", 
                               title="[bold yellow]Cache Warning",
                               border_style="yellow"))
-        
+    
+        # Check memory usage after map generation when verbose is enabled
+        if self.verbose:
+            memory_usage = check_process_memory_usage()
+            logger.debug(f"Memory usage after map generation: {memory_usage}")
+    
         return map_str
 
     def map_to_string(self, map_data: Dict[str, Any]) -> str:

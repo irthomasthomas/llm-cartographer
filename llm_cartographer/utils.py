@@ -402,13 +402,21 @@ def memory_efficient_file_sample(file_path: Union[str, Path],
                     if len(last_lines) >= sample_lines:
                         break
         
-        # Combine first and last lines with a clear truncation indicator
-        combined = ''.join(first_lines)
-        if first_lines and last_lines and len(first_lines) < count_lines_in_file(path):
-            combined += '\n...\n[content truncated]\n...\n'
-        combined += '\n'.join(last_lines)
+        # Count total lines in file to determine if truncation is needed
+        total_lines = count_lines_in_file(path)
         
-        return combined
+        # Check if we need to show truncation
+        needs_truncation = total_lines > (sample_lines * 2)
+        
+        # Combine first and last lines with a clear truncation indicator if needed
+        first_content = ''.join(first_lines)
+        last_content = '\n'.join(last_lines)
+        
+        if needs_truncation:
+            return f"{first_content}\n...\n[content truncated]\n...\n{last_content}"
+        else:
+            return first_content + (last_content if last_content and not first_content.endswith(last_content) else "")
+            
     except Exception as e:
         logger.warning(f"Error getting file sample from {path}: {e}")
         return f"[Error reading file: {str(e)}]"
